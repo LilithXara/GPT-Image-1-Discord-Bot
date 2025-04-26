@@ -86,6 +86,12 @@ Buttons: 🔍 Upscale • 🎨 Remix • 🔁 Variate • 📤 Share
 
 ---
 
+## 🙋 Support
+
+Join our Discord server for help, feature requests, or just to share your creations: **[discord.gg/thelema](http://discord.gg/thelema)**
+
+---
+
 ## 🏗️ Architecture
 
 ```mermaid
@@ -103,15 +109,7 @@ flowchart TD
 
 ---
 
-## 📸 Gallery
 
-| Original | Remix | Upscale |
-|----------|-------|---------|
-| ![](assets/demo_orig.png) | ![](assets/demo_edit.png) | ![](assets/demo_up.png) |
-
-*(Drop your own before/after shots in `assets/` and they’ll render here.)*
-
----
 
 ## 🛠️ Contributing
 
