@@ -30,17 +30,13 @@ class ImagePrep:
         """
         im = Image.open(src).convert("RGBA")
         w,h = im.size
-        # scale down or up to fit within side×side
         im.thumbnail((side,side), Image.LANCZOS)
-
-        # centre it on a transparent canvas
         canvas = Image.new("RGBA", (side,side), (0,0,0,0))
         x = (side - im.width)//2
         y = (side - im.height)//2
         canvas.paste(im,(x,y),im)
         dst = SAVE_DIR / f"{uuid.uuid4()}.png"
         canvas.save(dst, "PNG")
-        # return the paste-box so caller can build a mask for exactly that region
         return dst, (x,y,im.width,im.height)
 
     @staticmethod
@@ -53,7 +49,6 @@ class ImagePrep:
 
     @staticmethod
     def prep_for_edit(src: Path) -> Tuple[Path, Path]:
-        # your existing full-canvas edit helper (regenerate everywhere)
         png = ImagePrep.to_png(src)
         sqr, _ = ImagePrep.to_square(png,1024)
         mask = ImagePrep.white_mask(sqr)
@@ -67,26 +62,13 @@ class ImagePrep:
 
     @staticmethod
     def prep_for_outpaint(src: Path) -> Tuple[Path, Path]:
-        """
-        1) any → PNG
-        2) pad to centred 1024² PNG (transparent border)
-        3) build border-only white mask (so only the border is outpainted)
-        Returns (padded_src, border_mask)
-        """
         png = ImagePrep.to_png(src)
         sqr, (x,y,w,h) = ImagePrep.to_square(png,1024)
-
-        # build a black mask, then white out *only* the padding region
         mask = Image.new("L",(1024,1024),0)
-        # top stripe
         mask.paste(255, (0,0,1024,y))
-        # bottom stripe
         mask.paste(255, (0,y+h,1024,1024))
-        # left stripe
         mask.paste(255, (0,y, x, y+h))
-        # right stripe
         mask.paste(255, (x+w,y,1024,y+h))
-
         mpath = SAVE_DIR/f"{uuid.uuid4()}_border_mask.png"
         mask.save(mpath,"PNG")
         return sqr, mpath
@@ -100,7 +82,7 @@ import aiohttp, discord, openai
 from discord.ext import commands
 from discord.ui import View, Modal, TextInput
 
-from PIL import Image                # ← pillow
+from PIL import Image
 
 # ───── logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -112,10 +94,10 @@ log = logging.getLogger("img-bot")
 
 # ───── configuration ────────────────────────────────────────────────────────
 openai.api_key = "KEY HERE"
-BOT_PREFIX           = "!img"
-VISION_MODEL         = "gpt-4o-mini"
-SAVE_DIR             = Path("generated"); SAVE_DIR.mkdir(exist_ok=True)
-SHARE_CHANNEL_ID     = 1046274509143019601  # hard-coded channel
+BOT_PREFIX       = "!img"
+VISION_MODEL     = "gpt-4o-mini"
+SAVE_DIR         = Path("generated"); SAVE_DIR.mkdir(exist_ok=True)
+SHARE_CHANNEL_ID = YOUR_DISCORD_CHANNEL_ID
 
 CHOICES = {
     "size":   {"1024x1024","1024x1536","1536x1024"},
@@ -195,13 +177,7 @@ def parse(tokens: List[str]) -> Tuple[str, Dict[str,str]]:
     for tok in it:
         if tok.startswith("--"):
             key, eq, tail = tok.lstrip("-").partition("=")
-            if eq:
-                val = tail
-            else:
-                nxt = next(it, None)
-                if nxt is None or nxt.startswith("--"):
-                    raise ValueError(f"--{key} needs a value")
-                val = nxt
+            val = tail if eq else next(it, None)
             flags[key] = val
         else:
             prompt_parts.append(tok)
@@ -264,16 +240,11 @@ async def variate(g: Gen, uid: str) -> Gen:
 
 # ★ NEW : true image‐guided remix helper with border outpaint ────────────────
 async def edit_img(g: Gen, new_prompt: str, uid: str) -> Gen:
-    """
-    1️⃣ Outpaint any non-square border so you never see black.
-    2️⃣ Then do a real images.edit (GPT-Image-1) on the full canvas.
-    3️⃣ On any error, fall back to generate().
-    """
     base_prompt = g.prompt or new_prompt
     combined    = f"{base_prompt}, {new_prompt}" if g.prompt else new_prompt
     log.info("edit      | user=%s | file=%s", uid, g.file)
 
-    # ─── Phase 1: outpaint the edges ────────────────────────────────────
+    # Phase 1: outpaint edges
     try:
         square_png, border_mask = ImagePrep.prep_for_edit(g.file)
         r0 = await asyncio.to_thread(
@@ -282,9 +253,7 @@ async def edit_img(g: Gen, new_prompt: str, uid: str) -> Gen:
             image=open(square_png,  "rb"),
             mask=open(border_mask, "rb"),
             prompt=base_prompt,
-            n=1,
-            size="1024x1024",
-            user=uid
+            n=1, size="1024x1024", user=uid
         )
         data0 = r0.data[0]
         out0  = SAVE_DIR / f"{uuid.uuid4()}.png"
@@ -296,7 +265,7 @@ async def edit_img(g: Gen, new_prompt: str, uid: str) -> Gen:
     except openai.OpenAIError as e:
         log.warning("outpaint step failed (%s), continuing", e)
 
-    # ─── Phase 2: full-canvas edit ────────────────────────────────────────
+    # Phase 2: full-canvas edit
     try:
         src_png, mask_png = ImagePrep.prep_for_edit(g.file)
         r1 = await asyncio.to_thread(
@@ -305,9 +274,7 @@ async def edit_img(g: Gen, new_prompt: str, uid: str) -> Gen:
             image=open(src_png,  "rb"),
             mask=open(mask_png, "rb"),
             prompt=combined,
-            n=1,
-            size="1024x1024",
-            user=uid
+            n=1, size="1024x1024", user=uid
         )
         data1 = r1.data[0]
         out1  = SAVE_DIR / f"{uuid.uuid4()}.png"
@@ -319,7 +286,7 @@ async def edit_img(g: Gen, new_prompt: str, uid: str) -> Gen:
     except openai.OpenAIError as e:
         log.warning("full edit failed (%s) – falling back to generate", e)
 
-    # ─── Final fallback: regular generate() ───────────────────────────────
+    # Final fallback
     g2, _ = await generate(combined, {"size":g.size,"quality":g.qual}, uid)
     return g2
 
@@ -337,8 +304,7 @@ class HelpView(View):
         self.pages = [
             discord.Embed(title="GPT-Image-1 Bot", description="Generate · Remix · Upscale · Share"),
             discord.Embed(
-                title="Flags & defaults",
-                description=(
+                title="Flags & defaults", description=(
                     "**Defaults:** png 1024²  medium  vivid\n"
                     "`--size` 1024² / 1024×1536 / 1536×1024\n"
                     "`--quality` low / medium / high\n"
@@ -348,27 +314,29 @@ class HelpView(View):
                 )
             ),
             discord.Embed(
-                title="Examples",
-                description=(
+                title="Examples", description=(
                     "`!img neon koi --style cinematic --size 1536x1024`\n"
                     "mention + image → caption & buttons\n"
                     "reply *laser eyes* to add lasers"
                 )
             ),
         ]
-        self.i = 0
-        self._sync()
+        self.i = 0; self._sync()
+
     def _sync(self):
         self.prev.disabled = (self.i == 0)
         self.next.disabled = (self.i == len(self.pages)-1)
+
     @discord.ui.button(label="⏪ Prev", style=discord.ButtonStyle.secondary)
     async def prev(self, inter, _):
         self.i -= 1; self._sync()
         await inter.response.edit_message(embed=self.pages[self.i], view=self)
+
     @discord.ui.button(label="Next ⏩", style=discord.ButtonStyle.secondary)
     async def next(self, inter, _):
         self.i += 1; self._sync()
         await inter.response.edit_message(embed=self.pages[self.i], view=self)
+
     @discord.ui.button(label="✖ Close", style=discord.ButtonStyle.danger)
     async def close(self, inter, _):
         await inter.message.delete(); self.stop()
@@ -380,6 +348,7 @@ class RemixModal(Modal):
         self.g = g
         self.t = TextInput(label="New prompt")
         self.add_item(self.t)
+
     async def on_submit(self, inter):
         await inter.response.defer()
         async with inter.channel.typing():
@@ -387,7 +356,7 @@ class RemixModal(Modal):
         m = await inter.followup.send(
             content=f"Prompt: **{g2.prompt}**",
             file=discord.File(g2.file),
-            view=ImgView(g2, inter.user.id)     # ← buttons!
+            view=ImgView(g2, inter.user.id)
         )
         cache_save(m.id, inter.user.id, g2)
 
@@ -396,6 +365,7 @@ class ImgView(View):
     def __init__(self, g:Gen, uid:int):
         super().__init__(timeout=None)
         self.g, self.uid = g, uid
+
     async def interaction_check(self, inter):
         if inter.user.id != self.uid:
             await inter.response.send_message("Only the creator can use these.", ephemeral=True)
@@ -407,11 +377,11 @@ class ImgView(View):
         await inter.response.send_message("🔄 Upscaling…", ephemeral=True)
         best = {"1024x1024":"1536x1024","1024x1536":"1024x1536","1536x1024":"1536x1024"}[self.g.size]
         async with inter.channel.typing():
-            g2,_ = await generate(self.g.prompt, {"quality":"high","size":best}, str(self.uid))
+            g2,_ = await generate(self.g.prompt,{"quality":"high","size":best},str(self.uid))
         m = await inter.followup.send(
             content=f"Prompt: **{g2.prompt}**",
             file=discord.File(g2.file),
-            view=ImgView(g2, self.uid)         # ← buttons here too
+            view=ImgView(g2, self.uid)
         )
         cache_save(m.id, self.uid, g2)
 
@@ -427,7 +397,7 @@ class ImgView(View):
         m = await inter.followup.send(
             content=f"Prompt: **{g2.prompt}**",
             file=discord.File(g2.file),
-            view=ImgView(g2, self.uid)         # ← and here
+            view=ImgView(g2, self.uid)
         )
         cache_save(m.id, self.uid, g2)
 
@@ -437,11 +407,8 @@ class ImgView(View):
             await inter.response.send_message("Share channel not set.", ephemeral=True)
             return
         ch = bot.get_channel(SHARE_CHANNEL_ID)
-
-        # include the prompt in the share
         share_content = f"Prompt: **{self.g.prompt}**\nShared by {inter.user.mention}"
         await ch.send(content=share_content, file=discord.File(self.g.file))
-
         await inter.response.send_message("✅ Shared!", ephemeral=True)
 
 # ───── events ───────────────────────────────────────────────────────────────
@@ -482,7 +449,7 @@ async def on_message(msg: discord.Message):
                 m = await msg.channel.send(
                     content=f"Prompt: **{g1.prompt}**",
                     file=discord.File(g1.file),
-                    view=ImgView(g1, msg.author.id)   # ← buttons!
+                    view=ImgView(g1, msg.author.id)
                 )
                 cache_save(m.id, msg.author.id, g1)
                 return
@@ -494,7 +461,7 @@ async def on_message(msg: discord.Message):
         m = await msg.channel.send(
             content=cap,
             file=discord.File(path),
-            view=ImgView(g, msg.author.id)      # ← buttons!
+            view=ImgView(g, msg.author.id)
         )
         cache_save(m.id, msg.author.id, g)
         return
@@ -510,12 +477,20 @@ async def on_message(msg: discord.Message):
         if not prompt and not flags:
             await msg.reply(embed=HelpView().pages[0], view=HelpView())
             return
-        async with msg.channel.typing():
-            g, cost = await generate(prompt, flags, str(msg.author.id))
+        try:
+            async with msg.channel.typing():
+                g, cost = await generate(prompt, flags, str(msg.author.id))
+        except openai.OpenAIError as e:
+            if getattr(e, "code", None) == "moderation_blocked":
+                await msg.reply(
+                    "⚠️ Your request was blocked by the safety filter. Please try rephrasing your prompt."
+                )
+                return
+            raise
         m = await msg.reply(
             content=f"Prompt: **{g.prompt}**",
             file=discord.File(g.file),
-            view=ImgView(g, msg.author.id)      # ← buttons!
+            view=ImgView(g, msg.author.id)
         )
         cache_save(m.id, msg.author.id, g)
         return
@@ -526,12 +501,20 @@ async def on_message(msg: discord.Message):
         if ref and ref.author.id == bot.user.id:
             g0 = cache_load(ref.id)
             if g0:
-                async with msg.channel.typing():
-                    g1 = await edit_img(g0, msg.content.strip(), str(msg.author.id))
+                try:
+                    async with msg.channel.typing():
+                        g1 = await edit_img(g0, msg.content.strip(), str(msg.author.id))
+                except openai.OpenAIError as e:
+                    if getattr(e, "code", None) == "moderation_blocked":
+                        await msg.reply(
+                            "⚠️ Your edit request was blocked by the safety filter. Try a different instruction."
+                        )
+                        return
+                    raise
                 m = await msg.reply(
                     content=f"Prompt: **{g1.prompt}**",
                     file=discord.File(g1.file),
-                    view=ImgView(g1, msg.author.id)  # ← buttons!
+                    view=ImgView(g1, msg.author.id)
                 )
                 cache_save(m.id, msg.author.id, g1)
                 return
