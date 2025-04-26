@@ -1,17 +1,58 @@
-"""
-discord_image_bot.py – GPT-Image-1 Discord bot
-(logging, paged help, true image-guided Remix, safe Upscale)
-"""
-
 # ───── image_prep utilities ──────────────────────────────────────────────────
 from __future__ import annotations
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Dict, List, Optional
 import uuid
-from PIL import Image
 
+from PIL import Image
+import torch
+import numpy as np
+from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
+
+# where masks and converted images go
 SAVE_DIR = Path("generated")
 SAVE_DIR.mkdir(exist_ok=True)
+
+# one-time CLIPSeg globals (module scope)
+_SEG_PROCESSOR = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
+_SEG_MODEL     = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
+
+def segment_mask(image_path: Path, text: str, threshold: float = 0.3) -> Path:
+    """
+    Zero-shot mask for “text” on image_path via CLIPSeg.
+    White = pixels to modify, black = pixels to preserve.
+    """
+    im = Image.open(image_path).convert("RGB")
+
+    # 1️⃣ tokenize the text
+    text_inputs = _SEG_PROCESSOR.tokenizer(
+        [text], padding=True, truncation=True, return_tensors="pt"
+    )
+
+    # 2️⃣ preprocess the image (we only need the pixel_values array)
+    image_batch = _SEG_PROCESSOR.image_processor(images=[im])["pixel_values"]
+
+    # 3️⃣ coerce into a plain array, then into a torch.Tensor
+    arr = np.asarray(image_batch)
+    pixel_values = torch.tensor(arr)
+
+    # 4️⃣ run the model
+    with torch.no_grad():
+        outputs = _SEG_MODEL(
+            input_ids=text_inputs["input_ids"],
+            attention_mask=text_inputs["attention_mask"],
+            pixel_values=pixel_values,
+        )
+
+    # 5️⃣ threshold & upsample
+    logits = outputs.logits[0, 0].cpu().numpy()
+    mask_arr = (logits > threshold).astype(np.uint8) * 255
+    mask = Image.fromarray(mask_arr, mode="L").resize(im.size, Image.LANCZOS)
+
+    # 6️⃣ save & return
+    dst = SAVE_DIR / f"{uuid.uuid4()}_auto_mask.png"
+    mask.save(dst, "PNG")
+    return dst
 
 class ImagePrep:
     @staticmethod
@@ -23,66 +64,60 @@ class ImagePrep:
         return dst
 
     @staticmethod
-    def to_square(src: Path, side: int = 1024) -> Tuple[Path, Tuple[int,int,int,int]]:
-        """
-        Letter-box *src* to a centred side×side PNG.
-        Returns (new_png_path, paste_box) where paste_box = (x,y,w,h)
-        """
+    def to_square(src: Path, side: int = 1024, bg_color: Tuple[int,int,int]=(255,255,255)) -> Path:
         im = Image.open(src).convert("RGBA")
-        w,h = im.size
-        im.thumbnail((side,side), Image.LANCZOS)
-        canvas = Image.new("RGBA", (side,side), (0,0,0,0))
-        x = (side - im.width)//2
-        y = (side - im.height)//2
-        canvas.paste(im,(x,y),im)
+        im.thumbnail((side, side), Image.LANCZOS)
+        canvas = Image.new("RGB", (side, side), bg_color)
+        canvas.paste(im, ((side - im.width)//2, (side - im.height)//2), im)
         dst = SAVE_DIR / f"{uuid.uuid4()}.png"
         canvas.save(dst, "PNG")
-        return dst, (x,y,im.width,im.height)
+        return dst
 
     @staticmethod
     def white_mask(for_image: Path) -> Path:
-        w,h = Image.open(for_image).size
-        mask = Image.new("L",(w,h),255)
+        w, h = Image.open(for_image).size
+        mask = Image.new("L", (w, h), 255)
         dst = SAVE_DIR / f"{for_image.stem}_mask.png"
-        mask.save(dst,"PNG")
+        mask.save(dst, "PNG")
         return dst
 
     @staticmethod
     def prep_for_edit(src: Path) -> Tuple[Path, Path]:
         png = ImagePrep.to_png(src)
-        sqr, _ = ImagePrep.to_square(png,1024)
+        sqr = ImagePrep.to_square(png, 1024)
         mask = ImagePrep.white_mask(sqr)
         return sqr, mask
 
     @staticmethod
     def prep_for_variation(src: Path) -> Path:
         png = ImagePrep.to_png(src)
-        sqr, _ = ImagePrep.to_square(png,1024)
-        return sqr
+        return ImagePrep.to_square(png, 1024)
 
     @staticmethod
     def prep_for_outpaint(src: Path) -> Tuple[Path, Path]:
         png = ImagePrep.to_png(src)
-        sqr, (x,y,w,h) = ImagePrep.to_square(png,1024)
-        mask = Image.new("L",(1024,1024),0)
-        mask.paste(255, (0,0,1024,y))
-        mask.paste(255, (0,y+h,1024,1024))
-        mask.paste(255, (0,y, x, y+h))
-        mask.paste(255, (x+w,y,1024,y+h))
-        mpath = SAVE_DIR/f"{uuid.uuid4()}_border_mask.png"
-        mask.save(mpath,"PNG")
+        sqr = ImagePrep.to_square(png, 1024)
+        im = Image.open(png).convert("RGBA")
+        im.thumbnail((1024,1024), Image.LANCZOS)
+        x = (1024 - im.width)//2
+        y = (1024 - im.height)//2
+        w, h = im.width, im.height
+        border_mask = Image.new("L", (1024,1024), 0)
+        border_mask.paste(255, (0, 0, 1024, y))
+        border_mask.paste(255, (0, y+h, 1024, 1024))
+        border_mask.paste(255, (0, y, x, y+h))
+        border_mask.paste(255, (x+w, y, 1024, y+h))
+        mpath = SAVE_DIR / f"{uuid.uuid4()}_border_mask.png"
+        border_mask.save(mpath, "PNG")
         return sqr, mpath
 
 # ───── imports ───────────────────────────────────────────────────────────────
-import os, re, shlex, asyncio, base64, uuid, sqlite3, logging, sys
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+import os, re, shlex, asyncio, base64, sqlite3, logging, sys
+from typing import Tuple
 
 import aiohttp, discord, openai
 from discord.ext import commands
 from discord.ui import View, Modal, TextInput
-
-from PIL import Image
 
 # ───── logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -93,11 +128,11 @@ logging.basicConfig(
 log = logging.getLogger("img-bot")
 
 # ───── configuration ────────────────────────────────────────────────────────
-openai.api_key = "KEY HERE"
+openai.api_key = "KEY"
 BOT_PREFIX       = "!img"
 VISION_MODEL     = "gpt-4o-mini"
 SAVE_DIR         = Path("generated"); SAVE_DIR.mkdir(exist_ok=True)
-SHARE_CHANNEL_ID = YOUR_DISCORD_CHANNEL_ID
+SHARE_CHANNEL_ID = YOUR_CHANNEL_ID
 
 CHOICES = {
     "size":   {"1024x1024","1024x1536","1536x1024"},
@@ -177,7 +212,13 @@ def parse(tokens: List[str]) -> Tuple[str, Dict[str,str]]:
     for tok in it:
         if tok.startswith("--"):
             key, eq, tail = tok.lstrip("-").partition("=")
-            val = tail if eq else next(it, None)
+            if eq:
+                val = tail
+            else:
+                nxt = next(it, None)
+                if nxt is None or nxt.startswith("--"):
+                    raise ValueError(f"--{key} needs a value")
+                val = nxt
             flags[key] = val
         else:
             prompt_parts.append(tok)
@@ -186,65 +227,116 @@ def parse(tokens: List[str]) -> Tuple[str, Dict[str,str]]:
 def price(quality: str) -> float:
     return {"low":0.02,"medium":0.04,"high":0.08}.get(quality,0.04)
 
-# ───── OpenAI wrappers ──────────────────────────────────────────────────────
-async def generate(prompt: str, flags: Dict[str,str], uid: str) -> Tuple[Gen,float]:
-    size  = flags.get("size","1024x1024")
-    qual  = flags.get("quality","medium")
-    style = flags.get("style","vivid")
-    fmt   = flags.get("format","png")
-    n     = int(flags.get("n",1))
-    seed  = int(flags["seed"]) if "seed" in flags else None
+# ───── hidden instruction to *always* preserve everything else ─────────────
+HIDDEN_INSTRUCTION = (
+  "You are a precise image inpainting assistant. "
+  "Always preserve every pixel of the original image that is not explicitly covered by the mask. "
+  "Keep composition, lighting, perspective, and textures exactly as they are. "
+  "Do not introduce any new objects, symbols, or graphical elements – only recolor or retouch the existing pixels. "
+  "Only apply the exact modification described in the user’s instructions below: "
+)
 
-    if style in EXTRA_STYLE:
-        prompt = EXTRA_STYLE[style] + prompt
-
-    payload = {
-        "model":  "gpt-image-1",
-        "prompt": prompt,
-        "n":       n,
-        "size":    size,
-        "quality": qual,
-        "user":    uid
-    }
-    if seed:
-        payload["seed"] = seed
-    if "transparent" in flags or (fmt=="png" and flags.get("transparent")==""):
-        payload["transparent_background"] = True
-
-    log.info("generate  | user=%s | flags=%s", uid, flags)
-    r = await asyncio.to_thread(openai.images.generate, **payload)
-    d = r.data[0]
-
-    dest = SAVE_DIR / f"{uuid.uuid4()}.{fmt}"
-    if getattr(d,"url",None):
-        await download_url(str(d.url), dest)
-    else:
-        dest.write_bytes(base64.b64decode(d.b64_json))
-
-    return Gen(prompt,dest,size,qual,seed), price(qual)
-
+# …later, replace variate() with:
 async def variate(g: Gen, uid: str) -> Gen:
-    new_prompt = f"{g.prompt} (variation)"
+    """
+    Produce a faithful “variation” by doing a full‐canvas masked edit
+    (never falling back to create_variation).
+    """
     log.info("variate   | user=%s | file=%s", uid, g.file)
 
-    src = ImagePrep.prep_for_variation(g.file)
-    with open(src, "rb") as fp:
-        r = await asyncio.to_thread(
-            openai.images.create_variation,
-            image=fp, n=1, size="1024x1024", user=uid
-        )
+    src_png, mask_png = ImagePrep.prep_for_edit(g.file)
 
-    dest = SAVE_DIR / f"{uuid.uuid4()}.jpg"
-    await download_url(str(r.data[0].url), dest)
-    return Gen(new_prompt,dest,"1024x1024",g.qual,g.seed)
+    full_prompt = (
+        HIDDEN_INSTRUCTION
+        + "Generate a subtle variation of the original image, changing as little as possible."
+    )
+
+    try:
+        r = await asyncio.to_thread(
+            openai.images.edit,
+            model="gpt-image-1",
+            image=open(src_png,  "rb"),
+            mask=open(mask_png, "rb"),
+            prompt=full_prompt,
+            n=1,
+            size="1024x1024",
+            user=uid,
+        )
+        d = r.data[0]
+        out = SAVE_DIR / f"{uuid.uuid4()}.png"
+        if getattr(d, "url", None):
+            await download_url(str(d.url), out)
+        else:
+            out.write_bytes(base64.b64decode(d.b64_json))
+
+        return Gen(f"{g.prompt} (variation)", out, "1024x1024", g.qual, g.seed)
+
+    except openai.OpenAIError as e:
+        log.warning("variate edit failed (%s) – falling back to regular generate", e)
+        g2, _ = await generate(g.prompt, {"size": "1024x1024", "quality": g.qual}, uid)
+        return Gen(f"{g.prompt} (variation)", g2.file, "1024x1024", g.qual, g2.seed)
+        
+# ───── scope classification ──────────────────────────────────────────────────
+        
+# operations that imply you really want to recolor/restore/enhance the whole image
+GLOBAL_HINTS = {
+    "enhance", "sharpen", "stylize", "denoise", "upscale",
+}
+
+# operations that imply you only want to touch a region or the subject itself
+LOCAL_HINTS = {
+    "colorize", "restore", "recolor", "repaint", "tint",
+    "remove", "erase", "replace", "swap", "turn into", "add", "overlay",
+    "background", "foreground", "sky", "face", "hair", "eyes",
+    "shirt", "hat", "dog", "cat", "tree", "car", "window",
+}
+
+# ───── LLM‐assisted scope classifier ─────────────────────────────────────────
+
+async def classify_scope(prompt: str, uid: str) -> str:
+    """
+    Ask the LLM whether this edit prompt is 'local' (region-based) or 'global' (whole-image).
+    Returns exactly "local" or "global" (defaults to "global" on any error/uncertainty).
+    """
+    system_msg = (
+        "You are an assistant that replies with exactly one word: 'local' if the user's edit "
+        "instruction affects only a specific region or object in the image, or 'global' if it "
+        "modifies the entire image."
+    )
+    user_msg = f'"{prompt}"'
+    try:
+        resp = await asyncio.to_thread(
+            openai.chat.completions.create,
+            model=VISION_MODEL,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            user=uid,
+        )
+        answer = resp.choices[0].message.content.strip().lower()
+        if answer.startswith("local"):
+            return "local"
+        if answer.startswith("global"):
+            return "global"
+    except Exception:
+        log.warning("scope classification failed, defaulting to global")
+    return "global"
 
 # ★ NEW : true image‐guided remix helper with border outpaint ────────────────
 async def edit_img(g: Gen, new_prompt: str, uid: str) -> Gen:
+    """
+    1️⃣ Outpaint any non‐square border so you never see black.
+    2️⃣ Classify scope via LLM: if 'local', auto‐segment; if 'global', keep full‐mask.
+    3️⃣ Then do a real images.edit (GPT‐Image‐1) on the full canvas,
+       with a hidden “preserve everything else” prefix.
+    4️⃣ On any error, fall back to generate().
+    """
     base_prompt = g.prompt or new_prompt
-    combined    = f"{base_prompt}, {new_prompt}" if g.prompt else new_prompt
+    full_prompt = HIDDEN_INSTRUCTION + new_prompt
     log.info("edit      | user=%s | file=%s", uid, g.file)
 
-    # Phase 1: outpaint edges
+    # ─── Phase 1: outpaint edges ───────────────────────────────────────────────
     try:
         square_png, border_mask = ImagePrep.prep_for_edit(g.file)
         r0 = await asyncio.to_thread(
@@ -253,41 +345,52 @@ async def edit_img(g: Gen, new_prompt: str, uid: str) -> Gen:
             image=open(square_png,  "rb"),
             mask=open(border_mask, "rb"),
             prompt=base_prompt,
-            n=1, size="1024x1024", user=uid
+            n=1,
+            size="1024x1024",
+            user=uid,
         )
-        data0 = r0.data[0]
-        out0  = SAVE_DIR / f"{uuid.uuid4()}.png"
-        if getattr(data0,"url",None):
-            await download_url(str(data0.url), out0)
+        d0 = r0.data[0]
+        out0 = SAVE_DIR / f"{uuid.uuid4()}.png"
+        if getattr(d0, "url", None):
+            await download_url(str(d0.url), out0)
         else:
-            out0.write_bytes(base64.b64decode(data0.b64_json))
+            out0.write_bytes(base64.b64decode(d0.b64_json))
         g = Gen(base_prompt, out0, "1024x1024", g.qual, g.seed)
     except openai.OpenAIError as e:
         log.warning("outpaint step failed (%s), continuing", e)
 
-    # Phase 2: full-canvas edit
+    # ─── Phase 2: classify scope & build mask ─────────────────────────────────
+    src_png, default_mask = ImagePrep.prep_for_edit(g.file)
+    scope = await classify_scope(new_prompt, uid)
+    if scope == "local":
+        mask_to_use = segment_mask(src_png, new_prompt)
+    else:
+        mask_to_use = default_mask
+
+    # ─── Phase 3: actual inpainting edit ──────────────────────────────────────
     try:
-        src_png, mask_png = ImagePrep.prep_for_edit(g.file)
         r1 = await asyncio.to_thread(
             openai.images.edit,
             model="gpt-image-1",
-            image=open(src_png,  "rb"),
-            mask=open(mask_png, "rb"),
-            prompt=combined,
-            n=1, size="1024x1024", user=uid
+            image=open(src_png,    "rb"),
+            mask=open(mask_to_use, "rb"),
+            prompt=full_prompt,
+            n=1,
+            size="1024x1024",
+            user=uid,
         )
-        data1 = r1.data[0]
-        out1  = SAVE_DIR / f"{uuid.uuid4()}.png"
-        if getattr(data1,"url",None):
-            await download_url(str(data1.url), out1)
+        d1 = r1.data[0]
+        out1 = SAVE_DIR / f"{uuid.uuid4()}.png"
+        if getattr(d1, "url", None):
+            await download_url(str(d1.url), out1)
         else:
-            out1.write_bytes(base64.b64decode(data1.b64_json))
-        return Gen(combined, out1, "1024x1024", g.qual, g.seed)
+            out1.write_bytes(base64.b64decode(d1.b64_json))
+        return Gen(new_prompt, out1, "1024x1024", g.qual, g.seed)
     except openai.OpenAIError as e:
         log.warning("full edit failed (%s) – falling back to generate", e)
 
-    # Final fallback
-    g2, _ = await generate(combined, {"size":g.size,"quality":g.qual}, uid)
+    # ─── Final fallback: regular generate ───────────────────────────────────────
+    g2, _ = await generate(new_prompt, {"size": g.size, "quality": g.qual}, uid)
     return g2
 
 # ───── Discord UI & bot setup ────────────────────────────────────────────────
@@ -457,7 +560,7 @@ async def on_message(msg: discord.Message):
             # else caption + buttons
             cap = await caption(att.url)
 
-        g = Gen(cap, path, "1024x1024", "medium", None)
+        g = Gen("", path, "1024x1024", "medium", None)
         m = await msg.channel.send(
             content=cap,
             file=discord.File(path),
@@ -523,7 +626,5 @@ async def on_message(msg: discord.Message):
 
 # ───── run ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    token="YOUR_DISCORD_TOKEN"
-    if not token:
-        raise SystemExit("DISCORD_TOKEN env var missing")
+    token="TOKEN"
     bot.run(token)
