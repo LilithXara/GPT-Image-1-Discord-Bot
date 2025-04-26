@@ -8,6 +8,18 @@ from PIL import Image
 import torch
 import numpy as np
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
+from io import BytesIO
+import uuid
+from PIL import Image
+import base64
+import asyncio
+import openai
+import logging
+import discord
+from discord.ui import View
+from pathlib import Path
+import re                                    # ← add at top of file if missing
+from PIL import ImageFilter                  # ← already installed with Pillow
 
 # where masks and converted images go
 SAVE_DIR = Path("generated")
@@ -128,7 +140,7 @@ logging.basicConfig(
 log = logging.getLogger("img-bot")
 
 # ───── configuration ────────────────────────────────────────────────────────
-openai.api_key = "KEY"
+openai.api_key = "YOUR_API_KEY"
 BOT_PREFIX       = "!img"
 VISION_MODEL     = "gpt-4o-mini"
 SAVE_DIR         = Path("generated"); SAVE_DIR.mkdir(exist_ok=True)
@@ -187,9 +199,15 @@ async def download_url(url, dest):
             dest.write_bytes(await r.read())
 
 async def download_att(att: discord.Attachment) -> Path:
-    dest = SAVE_DIR / f"{uuid.uuid4()}_{att.filename}"
-    await att.save(dest)
-    return dest
+  """
+  Download a Discord attachment into our SAVE_DIR, giving it a short
+  UUID-based filename (preserving its original extension).
+  """
+  # grab the extension (fallback to .png if none)
+  ext = Path(att.filename).suffix or ".png"
+  dst = SAVE_DIR / f"{uuid.uuid4()}{ext}"
+  await att.save(dst)
+  return dst
 
 async def caption(url: str) -> str:
     log.info("caption  | %s", url)
@@ -227,13 +245,13 @@ def parse(tokens: List[str]) -> Tuple[str, Dict[str,str]]:
 def price(quality: str) -> float:
     return {"low":0.02,"medium":0.04,"high":0.08}.get(quality,0.04)
 
-# ───── hidden instruction to *always* preserve everything else ─────────────
+# ───── tighten hidden instruction ─────────────────────────────────────────────
 HIDDEN_INSTRUCTION = (
-  "You are a precise image inpainting assistant. "
-  "Always preserve every pixel of the original image that is not explicitly covered by the mask. "
-  "Keep composition, lighting, perspective, and textures exactly as they are. "
-  "Do not introduce any new objects, symbols, or graphical elements – only recolor or retouch the existing pixels. "
-  "Only apply the exact modification described in the user’s instructions below: "
+    "You are a precise image inpainting assistant. "
+    "Only recolor or retouch existing pixels; do not introduce, remove, or redraw any "
+    "objects, symbols, text, or shapes. "
+    "Always preserve composition, lighting, perspective, and textures exactly as they are. "
+    "Only apply the exact modification described below: "
 )
 
 # …later, replace variate() with:
@@ -294,104 +312,130 @@ LOCAL_HINTS = {
 # ───── LLM‐assisted scope classifier ─────────────────────────────────────────
 
 async def classify_scope(prompt: str, uid: str) -> str:
-    """
-    Ask the LLM whether this edit prompt is 'local' (region-based) or 'global' (whole-image).
-    Returns exactly "local" or "global" (defaults to "global" on any error/uncertainty).
-    """
-    system_msg = (
-        "You are an assistant that replies with exactly one word: 'local' if the user's edit "
-        "instruction affects only a specific region or object in the image, or 'global' if it "
-        "modifies the entire image."
-    )
-    user_msg = f'"{prompt}"'
-    try:
-        resp = await asyncio.to_thread(
-            openai.chat.completions.create,
-            model=VISION_MODEL,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            user=uid,
-        )
-        answer = resp.choices[0].message.content.strip().lower()
-        if answer.startswith("local"):
-            return "local"
-        if answer.startswith("global"):
-            return "global"
-    except Exception:
-        log.warning("scope classification failed, defaulting to global")
-    return "global"
+  """
+  Ask the LLM if this edit is 'local' (a region) or 'global' (the whole image).
+  Returns exactly "local" or "global".
+  """
+  messages = [
+      {
+          "role": "system",
+          "content": (
+              "You are an image-edit classification assistant.  "
+              "Given a user’s edit prompt, decide if the instruction "
+              "targets only a specific part of the image (reply 'local') "
+              "or the entire image (reply 'global').  "
+              "Respond with exactly one word: either 'local' or 'global'."
+          ),
+      },
+      {"role": "user", "content": f"Edit prompt: {prompt}"}
+  ]
+  
+  comp = await asyncio.to_thread(
+      openai.chat.completions.create,
+      model=VISION_MODEL,
+      messages=messages,
+      user=uid,
+  )
+  answer = comp.choices[0].message.content.strip().lower()
+  return "local" if answer.startswith("local") else "global"
 
-# ★ NEW : true image‐guided remix helper with border outpaint ────────────────
-async def edit_img(g: Gen, new_prompt: str, uid: str) -> Gen:
+# ★ robust, image-guided remix helper ───────────────────────────────────
+async def edit_img(g: Gen, user_prompt: str, uid: str) -> Gen:
     """
-    1️⃣ Outpaint any non‐square border so you never see black.
-    2️⃣ Classify scope via LLM: if 'local', auto‐segment; if 'global', keep full‐mask.
-    3️⃣ Then do a real images.edit (GPT‐Image‐1) on the full canvas,
-       with a hidden “preserve everything else” prefix.
-    4️⃣ On any error, fall back to generate().
+    1. Optional square out-paint (best-effort).
+    2. LOCAL vs GLOBAL mask decision (keywords → LLM fallback).
+    3. Dilate LOCAL mask 8 px so pin-stripes / halos can’t slip through.
+    4. One images.edit call (PNG-header retry).  No silent fallback.
     """
-    base_prompt = g.prompt or new_prompt
-    full_prompt = HIDDEN_INSTRUCTION + new_prompt
-    log.info("edit      | user=%s | file=%s", uid, g.file)
+    import numpy as np
+    from PIL import Image, ImageFilter
 
-    # ─── Phase 1: outpaint edges ───────────────────────────────────────────────
+    base_prompt = g.prompt or user_prompt
+
+    def make_full_prompt(scope: str) -> str:
+        bg_guard = (" Keep every pixel outside the masked region untouched."
+                    if scope == "local" else "")
+        return (HIDDEN_INSTRUCTION + user_prompt +
+                bg_guard + " Do not add new objects, symbols, or text.")
+
+    log.info("edit_img | uid=%s | file=%s", uid, g.file)
+
+    # 1️⃣   best-effort border out-paint to 1024² ------------------------------
     try:
-        square_png, border_mask = ImagePrep.prep_for_edit(g.file)
+        sq_img, border_mask = ImagePrep.prep_for_edit(g.file)
         r0 = await asyncio.to_thread(
             openai.images.edit,
             model="gpt-image-1",
-            image=open(square_png,  "rb"),
+            image=open(sq_img,  "rb"),
             mask=open(border_mask, "rb"),
             prompt=base_prompt,
-            n=1,
-            size="1024x1024",
-            user=uid,
+            n=1, size="1024x1024", user=uid,
         )
-        d0 = r0.data[0]
-        out0 = SAVE_DIR / f"{uuid.uuid4()}.png"
+        tmp = SAVE_DIR / f"{uuid.uuid4()}.png"
+        d0  = r0.data[0]
         if getattr(d0, "url", None):
-            await download_url(str(d0.url), out0)
+            await download_url(d0.url, tmp)
         else:
-            out0.write_bytes(base64.b64decode(d0.b64_json))
-        g = Gen(base_prompt, out0, "1024x1024", g.qual, g.seed)
+            tmp.write_bytes(base64.b64decode(d0.b64_json))
+        g = Gen(base_prompt, tmp, "1024x1024", g.qual, g.seed)
     except openai.OpenAIError as e:
-        log.warning("outpaint step failed (%s), continuing", e)
+        log.warning("out-paint skipped (%s)", e)
 
-    # ─── Phase 2: classify scope & build mask ─────────────────────────────────
-    src_png, default_mask = ImagePrep.prep_for_edit(g.file)
-    scope = await classify_scope(new_prompt, uid)
+    # 2️⃣   scope → mask -------------------------------------------------------
+    def keyword_scope(p: str) -> Optional[str]:
+        p = p.lower()
+        if any(k in p for k in LOCAL_HINTS):  return "local"
+        if any(k in p for k in GLOBAL_HINTS): return "global"
+        return None
+
+    scope = keyword_scope(user_prompt) or await classify_scope(user_prompt, uid)
+
+    src_png, full_mask = ImagePrep.prep_for_edit(g.file)
     if scope == "local":
-        mask_to_use = segment_mask(src_png, new_prompt)
-    else:
-        mask_to_use = default_mask
+        # naive noun-phrase → before “to/with/in…”
+        obj_phrase = re.split(r"\b(to|with|in|on|into|onto)\b",
+                              user_prompt, 1)[0].strip()
+        mask_png   = segment_mask(src_png, obj_phrase, threshold=0.35)
 
-    # ─── Phase 3: actual inpainting edit ──────────────────────────────────────
-    try:
-        r1 = await asyncio.to_thread(
+        # —— 2️⃣.a  dilate 8 px to close pin-stripes ——
+        m = Image.open(mask_png).convert("L").filter(ImageFilter.MaxFilter(9))
+        m.save(mask_png)
+    else:
+        mask_png = full_mask
+
+    full_prompt = make_full_prompt(scope)
+
+    # 3️⃣   one images.edit call (header-retry) -------------------------------
+    async def run_edit(mask_path: Path):
+        return await asyncio.to_thread(
             openai.images.edit,
             model="gpt-image-1",
-            image=open(src_png,    "rb"),
-            mask=open(mask_to_use, "rb"),
+            image=open(src_png, "rb"),
+            mask=open(mask_path, "rb"),
             prompt=full_prompt,
-            n=1,
-            size="1024x1024",
-            user=uid,
+            n=1, size="1024x1024", user=uid,
         )
-        d1 = r1.data[0]
-        out1 = SAVE_DIR / f"{uuid.uuid4()}.png"
-        if getattr(d1, "url", None):
-            await download_url(str(d1.url), out1)
-        else:
-            out1.write_bytes(base64.b64decode(d1.b64_json))
-        return Gen(new_prompt, out1, "1024x1024", g.qual, g.seed)
-    except openai.OpenAIError as e:
-        log.warning("full edit failed (%s) – falling back to generate", e)
 
-    # ─── Final fallback: regular generate ───────────────────────────────────────
-    g2, _ = await generate(new_prompt, {"size": g.size, "quality": g.qual}, uid)
-    return g2
+    try:
+        r1 = await run_edit(mask_png)
+    except openai.BadRequestError as e:
+        if "invalid_mask_image_format" in str(e).lower():
+            log.warning("mask header glitch – one re-encode retry")
+            fixed = SAVE_DIR / f"{uuid.uuid4()}_mask_fix.png"
+            Image.open(mask_png).save(fixed, "PNG", optimize=False)
+            r1 = await run_edit(fixed)
+        else:
+            raise
+
+    # 4️⃣   save & return ------------------------------------------------------
+    d1  = r1.data[0]
+    out = SAVE_DIR / f"{uuid.uuid4()}.png"
+    if getattr(d1, "url", None):
+        await download_url(d1.url, out)
+    else:
+        out.write_bytes(base64.b64decode(d1.b64_json))
+
+    return Gen(user_prompt, out, "1024x1024", g.qual, g.seed)
 
 # ───── Discord UI & bot setup ────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -463,69 +507,188 @@ class RemixModal(Modal):
         )
         cache_save(m.id, inter.user.id, g2)
 
+async def generate(prompt: str, flags: Dict[str,str], uid: str) -> tuple[Gen, float]:
+    """
+    Fresh text→image gen honoring:
+      --size, --quality, --style, --format, --transparent, --seed, --n
+    Returns (Gen, cost).
+    """
+    # pull flags (with your defaults)
+    size       = flags.get("size", "1024x1024")
+    quality    = flags.get("quality", "medium")
+    n          = int(flags.get("n", 1))
+    style      = flags.get("style")
+    img_format = flags.get("format", "png")
+    transparent= "transparent" in flags
+    seed       = flags.get("seed")
+    
+    # style prefix
+    if style in EXTRA_STYLE:
+        prompt = EXTRA_STYLE[style] + prompt
+    
+    # images.generate call
+    params = {
+        "model": "gpt-image-1",
+        "prompt": prompt,
+        "n": n,
+        "size": size,
+        "user": uid,
+    }
+    if seed is not None:
+        params["seed"] = int(seed)
+    
+    resp = await asyncio.to_thread(openai.images.generate, **params)
+    
+    # save each result (we'll just take the first)
+    out_path = SAVE_DIR / f"{uuid.uuid4()}.{img_format}"
+    data = resp.data[0]
+    if getattr(data, "url", None):
+        await download_url(str(data.url), out_path)
+    else:
+        out_path.write_bytes(base64.b64decode(data.b64_json))
+    
+    # cost calc remains quality‐based
+    cost = price(quality) * n
+    
+    # return Gen (show only prompt+style) and cost
+    return Gen(prompt, out_path, size, quality, getattr(data, "seed", None)), cost
+
+log = logging.getLogger("img-bot")
+    
 # ───── Image view buttons ───────────────────────────────────────────────────
 class ImgView(View):
-    def __init__(self, g:Gen, uid:int):
-        super().__init__(timeout=None)
-        self.g, self.uid = g, uid
+  def __init__(self, g: Gen, uid: int):
+      super().__init__(timeout=None)
+      self.g, self.uid = g, uid
 
-    async def interaction_check(self, inter):
-        if inter.user.id != self.uid:
-            await inter.response.send_message("Only the creator can use these.", ephemeral=True)
-            return False
-        return True
+  async def interaction_check(self, inter):
+      if inter.user.id != self.uid:
+          await inter.response.send_message(
+              "Only the creator can use these buttons.", ephemeral=True
+          )
+          return False
+      return True
 
-    @discord.ui.button(label="🔍 Upscale", style=discord.ButtonStyle.primary)
-    async def up(self, inter, _):
-        await inter.response.send_message("🔄 Upscaling…", ephemeral=True)
-        best = {"1024x1024":"1536x1024","1024x1536":"1024x1536","1536x1024":"1536x1024"}[self.g.size]
-        async with inter.channel.typing():
-            g2,_ = await generate(self.g.prompt,{"quality":"high","size":best},str(self.uid))
-        m = await inter.followup.send(
-            content=f"Prompt: **{g2.prompt}**",
-            file=discord.File(g2.file),
-            view=ImgView(g2, self.uid)
-        )
-        cache_save(m.id, self.uid, g2)
+  # ─── 🔍 Upscale – true 16:9 out-paint to 1536 × 1024 ────────────────────────
+  @discord.ui.button(label="🔍 Upscale", style=discord.ButtonStyle.primary)
+  async def up(self, inter, _):
+      await inter.response.defer(ephemeral=True)
+  
+      # legal landscape canvas
+      TARGET_SIZE = "1536x1024"
+      W, H        = (1536, 1024)
+      log.info("Upscale canvas target: %s", TARGET_SIZE)
+  
+      # 1️⃣ build 1536×1024 RGB canvas with the source centred
+      src = Image.open(self.g.file).convert("RGBA")
+      src.thumbnail((W, H), Image.LANCZOS)
+  
+      canvas = Image.new("RGB", (W, H), (0, 0, 0))
+      x0, y0 = (W - src.width) // 2, (H - src.height) // 2
+      canvas.paste(src.convert("RGB"), (x0, y0), src)
+  
+      # 2️⃣ RGBA mask: *transparent border = editable*, opaque centre = keep
+      mask = Image.new("RGBA", (W, H), (0, 0, 0, 0))        # fully-editable
+      keep = Image.new("RGBA", (src.width, src.height), (0, 0, 0, 255))  # alpha 255
+      mask.paste(keep, (x0, y0))                            # protect the middle
+  
+      # 3️⃣ freeze both to disk so Pillow can’t silently optimise dimensions
+      img_path  = SAVE_DIR / f"{uuid.uuid4()}_img.png"
+      mask_path = SAVE_DIR / f"{uuid.uuid4()}_mask.png"
+      canvas.save(img_path, "PNG", optimize=False)
+      mask.save(mask_path,   "PNG", optimize=False)
+  
+      log.info("PNG written: %s  %s", img_path.name, mask_path.name)
+  
+      hidden_prompt = (
+          HIDDEN_INSTRUCTION +
+          "Extend the picture seamlessly into the transparent border. "
+          "Do not modify the opaque centre."
+      )
+  
+      async def call_edit():
+          return await asyncio.to_thread(
+              openai.images.edit,
+              model="gpt-image-1",
+              image=open(img_path,  "rb"),
+              mask=open(mask_path,  "rb"),
+              prompt=hidden_prompt,
+              n=1,
+              size=TARGET_SIZE,
+              user=str(self.uid),
+          )
+  
+      # 4️⃣ single retry if the server still complains about the mask header
+      try:
+          resp = await call_edit()
+      except openai.BadRequestError as e:
+          if "invalid_mask_image_format" in str(e).lower():
+              log.warning("mask header glitch – re-encoding once and retrying")
+              fixed = SAVE_DIR / f"{uuid.uuid4()}_mask_fix.png"
+              Image.open(mask_path).save(fixed, "PNG", optimize=False)
+              mask_path = fixed
+              resp = await call_edit()
+          else:
+              raise
+  
+      # 5️⃣ save & send the result
+      out = SAVE_DIR / f"{uuid.uuid4()}.png"
+      d   = resp.data[0]
+      if getattr(d, "url", None):
+          await download_url(str(d.url), out)
+      else:
+          out.write_bytes(base64.b64decode(d.b64_json))
+  
+      g2 = Gen(self.g.prompt or "(upscaled)", out, TARGET_SIZE, "high", self.g.seed)
+      m  = await inter.followup.send(
+          content=f"Prompt: **{g2.prompt}**",
+          file=discord.File(g2.file),
+          view=ImgView(g2, self.uid),
+      )
+      cache_save(m.id, self.uid, g2)
+      
+  # ─── other buttons unchanged ────────────────────────────────────────────
+  @discord.ui.button(label="🎨 Remix", style=discord.ButtonStyle.secondary)
+  async def rm(self, inter, _):
+      await inter.response.send_modal(RemixModal(self.g))
 
-    @discord.ui.button(label="🎨 Remix", style=discord.ButtonStyle.secondary)
-    async def rm(self, inter, _):
-        await inter.response.send_modal(RemixModal(self.g))
+  @discord.ui.button(label="🔁 Variate", style=discord.ButtonStyle.secondary)
+  async def var(self, inter, _):
+      await inter.response.send_message("🔄 Variation…", ephemeral=True)
+      async with inter.channel.typing():
+          g2 = await variate(self.g, str(self.uid))
+      m = await inter.followup.send(
+          content=f"Prompt: **{g2.prompt}**",
+          file=discord.File(g2.file),
+          view=ImgView(g2, self.uid),
+      )
+      cache_save(m.id, self.uid, g2)
 
-    @discord.ui.button(label="🔁 Variate", style=discord.ButtonStyle.secondary)
-    async def var(self, inter, _):
-        await inter.response.send_message("🔄 Variation…", ephemeral=True)
-        async with inter.channel.typing():
-            g2 = await variate(self.g, str(self.uid))
-        m = await inter.followup.send(
-            content=f"Prompt: **{g2.prompt}**",
-            file=discord.File(g2.file),
-            view=ImgView(g2, self.uid)
-        )
-        cache_save(m.id, self.uid, g2)
-
-    @discord.ui.button(label="📤 Share", style=discord.ButtonStyle.success)
-    async def sh(self, inter, _):
-        if not SHARE_CHANNEL_ID:
-            await inter.response.send_message("Share channel not set.", ephemeral=True)
-            return
-        ch = bot.get_channel(SHARE_CHANNEL_ID)
-        share_content = f"Prompt: **{self.g.prompt}**\nShared by {inter.user.mention}"
-        await ch.send(content=share_content, file=discord.File(self.g.file))
-        await inter.response.send_message("✅ Shared!", ephemeral=True)
+  @discord.ui.button(label="📤 Share", style=discord.ButtonStyle.success)
+  async def sh(self, inter, _):
+      if not SHARE_CHANNEL_ID:
+          await inter.response.send_message("Share channel not configured.", ephemeral=True)
+          return
+      channel = bot.get_channel(SHARE_CHANNEL_ID)
+      await channel.send(
+          content=f"Prompt: **{self.g.prompt}**\nShared by {inter.user.mention}",
+          file=discord.File(self.g.file),
+      )
+      await inter.response.send_message("✅ Shared!", ephemeral=True)
 
 # ───── events ───────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     log.info("Logged in as %s", bot.user)
 
+# ───── events ───────────────────────────────────────────────────────────────
 @bot.event
 async def on_message(msg: discord.Message):
     if msg.author.bot:
         return
 
     mention = f"<@{bot.user.id}>"
-    txt = msg.content
+    txt      = msg.content
     if txt.startswith(mention):
         txt = txt[len(mention):].lstrip()
     elif txt.startswith(BOT_PREFIX):
@@ -533,48 +696,52 @@ async def on_message(msg: discord.Message):
     else:
         txt = None
 
-    # help
+    # ─── help ----------------------------------------------------------------
     if msg.content.lower().strip() in {f"{BOT_PREFIX} help", f"{mention} help"}:
         await msg.reply(embed=HelpView().pages[0], view=HelpView())
         return
 
-    # mention + attachment
+    # ─── mention + attachment  (ping-image workflow) -------------------------
     if msg.attachments and bot.user in msg.mentions:
-        att  = msg.attachments[0]
-        ptxt = (txt or "").strip()
-        async with msg.channel.typing():
-            path = await download_att(att)
+        att         = msg.attachments[0]
+        user_prompt = (txt or "").strip()
 
-            # immediate edit if prompt given
-            if ptxt:
-                g0 = Gen("(original)", path, "1024x1024", "medium", None)
-                g1 = await edit_img(g0, ptxt, str(msg.author.id))
+        async with msg.channel.typing():
+            raw_path = await download_att(att)
+
+            # ① user supplied prompt  →  immediate edit
+            #    normalise the upload to a *clean* 1 024 × 1 024 PNG first
+            if user_prompt:
+                square_png, _ = ImagePrep.prep_for_edit(raw_path)
+                g0 = Gen("(original)", square_png, "1024x1024", "medium", None)
+                g1 = await edit_img(g0, user_prompt, str(msg.author.id))
+
                 m = await msg.channel.send(
                     content=f"Prompt: **{g1.prompt}**",
                     file=discord.File(g1.file),
-                    view=ImgView(g1, msg.author.id)
+                    view=ImgView(g1, msg.author.id),
                 )
                 cache_save(m.id, msg.author.id, g1)
                 return
 
-            # else caption + buttons
-            cap = await caption(att.url)
+            # ② no prompt  →  caption + buttons
+            caption_txt = await caption(att.url)
 
-        g = Gen("", path, "1024x1024", "medium", None)
+        g = Gen("", raw_path, "1024x1024", "medium", None)
         m = await msg.channel.send(
-            content=cap,
-            file=discord.File(path),
-            view=ImgView(g, msg.author.id)
+            content=caption_txt,
+            file=discord.File(raw_path),
+            view=ImgView(g, msg.author.id),
         )
         cache_save(m.id, msg.author.id, g)
         return
 
-    # blank ping → help
+    # ─── blank ping → help ---------------------------------------------------
     if txt is not None and not txt.strip():
         await msg.reply(embed=HelpView().pages[0], view=HelpView())
         return
 
-    # text prompt → generate
+    # ─── plain text prompt → fresh generate ----------------------------------
     if txt is not None:
         prompt, flags = parse(shlex.split(txt))
         if not prompt and not flags:
@@ -582,25 +749,29 @@ async def on_message(msg: discord.Message):
             return
         try:
             async with msg.channel.typing():
-                g, cost = await generate(prompt, flags, str(msg.author.id))
+                g, _ = await generate(prompt, flags, str(msg.author.id))
         except openai.OpenAIError as e:
             if getattr(e, "code", None) == "moderation_blocked":
                 await msg.reply(
-                    "⚠️ Your request was blocked by the safety filter. Please try rephrasing your prompt."
+                    "⚠️ Your request was blocked by the safety filter. "
+                    "Please try re-phrasing your prompt."
                 )
                 return
             raise
         m = await msg.reply(
             content=f"Prompt: **{g.prompt}**",
             file=discord.File(g.file),
-            view=ImgView(g, msg.author.id)
+            view=ImgView(g, msg.author.id),
         )
         cache_save(m.id, msg.author.id, g)
         return
 
-    # reply-remix
+    # ─── reply-remix ---------------------------------------------------------
     if msg.reference and msg.content.strip():
-        ref = msg.reference.resolved or await msg.channel.fetch_message(msg.reference.message_id)
+        ref = (
+            msg.reference.resolved
+            or await msg.channel.fetch_message(msg.reference.message_id)
+        )
         if ref and ref.author.id == bot.user.id:
             g0 = cache_load(ref.id)
             if g0:
@@ -610,18 +781,20 @@ async def on_message(msg: discord.Message):
                 except openai.OpenAIError as e:
                     if getattr(e, "code", None) == "moderation_blocked":
                         await msg.reply(
-                            "⚠️ Your edit request was blocked by the safety filter. Try a different instruction."
+                            "⚠️ Your edit request was blocked by the safety filter. "
+                            "Try a different instruction."
                         )
                         return
                     raise
                 m = await msg.reply(
                     content=f"Prompt: **{g1.prompt}**",
                     file=discord.File(g1.file),
-                    view=ImgView(g1, msg.author.id)
+                    view=ImgView(g1, msg.author.id),
                 )
                 cache_save(m.id, msg.author.id, g1)
                 return
 
+    # ─── allow other commands ------------------------------------------------
     await bot.process_commands(msg)
 
 # ───── run ───────────────────────────────────────────────────────────────────
