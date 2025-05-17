@@ -140,11 +140,11 @@ logging.basicConfig(
 log = logging.getLogger("img-bot")
 
 # ───── configuration ────────────────────────────────────────────────────────
-openai.api_key = "YOUR_API_KEY"
+openai.api_key = "key"
 BOT_PREFIX       = "!img"
 VISION_MODEL     = "gpt-4o-mini"
 SAVE_DIR         = Path("generated"); SAVE_DIR.mkdir(exist_ok=True)
-SHARE_CHANNEL_ID = YOUR_CHANNEL_ID
+SHARE_CHANNEL_ID = 1046274509143019601
 
 CHOICES = {
     "size":   {"1024x1024","1024x1536","1536x1024"},
@@ -684,8 +684,7 @@ async def on_ready():
 # ───── events ───────────────────────────────────────────────────────────────
 @bot.event
 async def on_message(msg: discord.Message):
-    if msg.author.bot:
-        return
+    
 
     mention = f"<@{bot.user.id}>"
     txt      = msg.content
